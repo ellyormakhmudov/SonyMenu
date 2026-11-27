@@ -94,6 +94,9 @@ final class Headphones: NSObject, ObservableObject {
     @Published private(set) var voiceAssistantOptions: [UInt8] = []
     @Published private(set) var touchPanel: Bool?
     @Published private(set) var multipoint: Bool?
+    /// Set when the headphones answered a multipoint change by keeping the old value.
+    @Published private(set) var multipointRefused = false
+    private var multipointWanted: Bool?
     @Published private(set) var voiceGuidance: Bool?
 
     // Playback
@@ -124,6 +127,10 @@ final class Headphones: NSObject, ObservableObject {
     private var lastNcParams: [UInt8]?
     private var lastNcSetAt = Date.distantPast
     private var openAttempts = 0
+    /// The RFCOMM channel reported open (a channel object alone can be stuck opening).
+    private var channelOpen = false
+    private var writeFailures = 0
+    private var ackMisses = 0
     private var batteryTimer: Timer?
     private var stateRequested = false
 
@@ -185,6 +192,13 @@ final class Headphones: NSObject, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.openChannel() }
     }
 
+    /// Closes the control channel cleanly, so the headphones accept a new one right away.
+    func stop() {
+        channel?.setDelegate(nil)
+        channel?.close()
+        channel = nil
+    }
+
     private func detach() {
         channel?.setDelegate(nil)
         channel?.close()
@@ -228,16 +242,43 @@ final class Headphones: NSObject, ObservableObject {
             return
         }
         channel = ch
+        channelOpen = false
         log("Opening channel \(channelID)")
+        // An async open can hang without ever calling back; don't wait forever.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+            guard let self, let ch, self.channel === ch, !self.channelOpen else { return }
+            self.log("Channel open timed out")
+            self.resetChannel()
+        }
+    }
+
+    /// Drops a broken channel and opens a fresh one.
+    private func resetChannel() {
+        channel?.setDelegate(nil)
+        channel?.close()
+        channel = nil
+        channelOpen = false
+        isReady = false
+        stateRequested = false
+        awaitingAck = false
+        queue.removeAll()
+        parser = MDR.StreamParser()
+        seq = 0
+        writeFailures = 0
+        ackMisses = 0
+        retryOpen()
     }
 
     private func retryOpen() {
         channel = nil
-        guard openAttempts < 4, device != nil else {
+        channelOpen = false
+        guard let d = device, d.isConnected() else { return }
+        if openAttempts >= 4 {
             problem = L("Couldn't connect to the headphone controls. Is the Sony app open on another device?")
-            return
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in self?.openChannel() }
+        // Keep trying while the headphones are connected: 2, 4, 8, 16, then every 30 s.
+        let delay = min(30.0, 2.0 * pow(2.0, Double(max(0, openAttempts - 1))))
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.openChannel() }
     }
 
     fileprivate func channelOpened(_ ch: IOBluetoothRFCOMMChannel, status: IOReturn) {
@@ -248,6 +289,9 @@ final class Headphones: NSObject, ObservableObject {
             return
         }
         log("Channel open")
+        channelOpen = true
+        openAttempts = 0
+        problem = nil
         send([Cmd.getProtocolInfo, 0x00])
         // Some firmwares answer only after the handshake; ask for state anyway.
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
@@ -259,10 +303,7 @@ final class Headphones: NSObject, ObservableObject {
     fileprivate func channelClosed(_ ch: IOBluetoothRFCOMMChannel) {
         guard ch === channel else { return }
         log("Channel closed")
-        channel = nil
-        isReady = false
-        stateRequested = false
-        if device?.isConnected() == true { retryOpen() } else { detach() }
+        if device?.isConnected() == true { resetChannel() } else { detach() }
     }
 
     // MARK: - Sending
@@ -287,6 +328,12 @@ final class Headphones: NSObject, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             guard let self, self.awaitingAck, self.ackToken == token else { return }
             self.awaitingAck = false
+            self.ackMisses += 1
+            if self.ackMisses >= 3 {
+                self.log("Headphones stopped answering, reconnecting")
+                self.resetChannel()
+                return
+            }
             self.pump()
         }
     }
@@ -297,7 +344,13 @@ final class Headphones: NSObject, ObservableObject {
         let r = data.withUnsafeMutableBytes { ptr in
             ch.writeSync(ptr.baseAddress, length: UInt16(ptr.count))
         }
-        if r != kIOReturnSuccess { log("Write error: \(String(format: "0x%x", r))") }
+        guard r == kIOReturnSuccess else {
+            log("Write error: \(String(format: "0x%x", r))")
+            writeFailures += 1
+            if writeFailures >= 2 { log("Control channel broken, reconnecting"); resetChannel() }
+            return
+        }
+        writeFailures = 0
     }
 
     // MARK: - Receiving
@@ -308,6 +361,7 @@ final class Headphones: NSObject, ObservableObject {
             case MDR.DataType.ack.rawValue:
                 seq = 1 &- seq
                 awaitingAck = false
+                ackMisses = 0
                 pump()
             case MDR.DataType.dataMDR.rawValue, MDR.DataType.dataMDRNo2.rawValue:
                 write(MDR.pack(type: .ack, seq: 1 &- frame.seq, payload: []))
@@ -341,7 +395,10 @@ final class Headphones: NSObject, ObservableObject {
         case Cmd.retDeviceInfo:
             var i = 2
             if type == 0x01 { modelName = MDR.string(p, at: &i) }
-            if type == 0x02 { firmware = MDR.string(p, at: &i); log("Firmware \(firmware ?? "?")") }
+            if type == 0x02 {
+                firmware = MDR.string(p, at: &i).map { String($0.filter { $0.isASCII && ($0.isNumber || $0 == ".") }.prefix(16)) }
+                log("Firmware \(firmware ?? "?")")
+            }
 
         case Cmd.commonRetStatus, Cmd.commonNtfyStatus:
             if type == Cmd.codecInquiry, p.count >= 3 { codec = Self.codecName(p[2]) }
@@ -402,7 +459,15 @@ final class Headphones: NSObject, ObservableObject {
         case Cmd.gsRetParam, Cmd.gsNtfyParam:
             guard p.count >= 4 else { return }
             if type == Cmd.gsTouchPanel { touchPanel = p[3] == 0x00 }
-            if type == Cmd.gsMultipoint { multipoint = p[3] == 0x00 }
+            if type == Cmd.gsMultipoint {
+                let now = p[3] == 0x00
+                if let wanted = multipointWanted, cmd == Cmd.gsNtfyParam {
+                    multipointWanted = nil
+                    multipointRefused = wanted != now
+                    if wanted != now { log("Headphones refused to turn multipoint \(wanted ? "on" : "off")") }
+                }
+                multipoint = now
+            }
             reply(cmd, type)
 
         case Cmd.audioRetParam, Cmd.audioNtfyParam:
@@ -443,7 +508,10 @@ final class Headphones: NSObject, ObservableObject {
             // one-byte length; "op…" entries with a two-byte length and a trailing zero.
             if type == 0x01, p.count > 3 {
                 var i = p[2] == 0 ? 3 : 2
-                let key = (MDR.string(p, at: &i) ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "\0"))
+                // Device-provided text: keep it to short plain ASCII before logging or matching.
+                let key = String((MDR.string(p, at: &i) ?? "").unicodeScalars
+                    .filter { $0.isASCII && ($0.properties.isAlphabetic || $0.properties.numericType != nil) }
+                    .prefix(40).map(Character.init))
                 log("Headphone event: \(key.isEmpty ? "(raw \(hex(p)))" : key)")
                 if !key.isEmpty { onEvent?(key) }
             }
@@ -497,7 +565,7 @@ final class Headphones: NSObject, ObservableObject {
             self.send([Cmd.ncAsmGetParam, self.ncType])
         }
         if batteryTimer == nil {
-            batteryTimer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in
+            batteryTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
                 Task { @MainActor in self?.send([Cmd.powerGetStatus, Cmd.powerBattery]) }
             }
         }
@@ -538,6 +606,9 @@ final class Headphones: NSObject, ObservableObject {
         // Wear/remove and similar events, if the firmware reports any, go to the log.
         if supports(Fn.timeSeriesLog) { send([Cmd.logSetStatus, 0x01, 0x00]) }
     }
+
+    /// For `--mediatest`: pretend the control link is up or down.
+    func simulateLink(_ up: Bool) { isReady = up; isPresent = true }
 
     /// Sample state for `--snapshot` renders.
     func loadSampleState(mode: SoundMode) {
@@ -698,9 +769,14 @@ final class Headphones: NSObject, ObservableObject {
         send([Cmd.gsSetParam, Cmd.gsTouchPanel, 0x00, on ? 0x00 : 0x01])
     }
 
+    /// Diagnostics only (--rawset).
+    func sendRaw(_ bytes: [UInt8]) { send(bytes) }
+
     func setMultipoint(_ on: Bool) {
         guard supports(Fn.gs2) else { return }
         multipoint = on
+        multipointWanted = on
+        multipointRefused = false
         send([Cmd.gsSetParam, Cmd.gsMultipoint, 0x00, on ? 0x00 : 0x01])
     }
 

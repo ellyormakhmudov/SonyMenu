@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import ApplicationServices
 import CoreGraphics
 import SwiftUI
@@ -73,8 +74,20 @@ enum Gesture: String, CaseIterable, Identifiable {
         }
     }
 
+    /// What the app does for this gesture when it's left on Default. The XM5 often sends its
+    /// playback command only to the other multipoint device (or not at all), so SonyMenu plays,
+    /// pauses and skips on the Mac itself as soon as the headphones report the gesture.
+    var ownedDefault: MacAction? {
+        switch self {
+        case .doubleTap: return .playPause
+        case .swipeForward: return .next
+        case .swipeBackward: return .previous
+        default: return nil
+        }
+    }
+
     var detail: String {
-        if mediaKey != nil { return String(format: L("Headphones: %@. Your choice replaces it."), builtIn) }
+        if mediaKey != nil { return String(format: L("Default: %@ on this Mac. Your choice replaces it."), builtIn) }
         if self == .leftHold { return L("Headphones: nothing. Free for any Mac action.") }
         return String(format: L("Headphones: %@. Your choice runs as well."), builtIn)
     }
@@ -86,6 +99,12 @@ enum MacAction: String, CaseIterable, Identifiable {
     case doubleTapOption, shortcut, openApp
 
     var id: String { rawValue }
+
+    /// Playback and volume: harmless to repeat, so never rate limited.
+    var isMedia: Bool {
+        [.keepDefault, .nothing, .playPause, .pause, .next, .previous, .previousSong,
+         .volumeUp, .volumeDown, .mute].contains(self)
+    }
 
     var title: String { L(titleKey) }
     private var titleKey: String {
@@ -124,6 +143,10 @@ enum MediaKey {
     static let play: Int32 = 16
     static let next: Int32 = 17
     static let previous: Int32 = 18
+
+    static func name(_ k: Int32) -> String {
+        [soundUp: "VOL+", soundDown: "VOL-", mute: "MUTE", play: "PLAY", next: "NEXT", previous: "PREV"][k] ?? "\(k)"
+    }
 }
 
 /// A recorded key combination, e.g. ⌥Space for a dictation app.
@@ -153,14 +176,30 @@ final class GestureController: ObservableObject {
     weak var headphones: Headphones?
     var log: (String) -> Void = { _ in }
 
+    private var readyWatch: AnyCancellable?
+    /// Log every media key (diagnostics), even when no gesture is remapped.
+    var observeKeys = UserDefaults.standard.object(forKey: "gestures.observeKeys") as? Bool ?? true
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var permissionTimer: Timer?
     private var recordMonitor: Any?
     /// When each gesture was last reported by the headphones.
     private var recent: [Gesture: Date] = [:]
+    private var actionTimes: [Date] = []
     /// Media keys swallowed while waiting to see whether the headphones report a gesture.
     private var pendingKeys: [Int32: DispatchWorkItem] = [:]
+    /// When each held media key arrived, to log how late the headphones' report is.
+    private var pendingSince: [Int32: Date] = [:]
+    /// How long a remapped media key waits for the headphones' report before it's treated as
+    /// a keyboard key and passed on. The report usually comes within 0.2 s.
+    static var holdWindow: TimeInterval = 0.8
+    /// When a default media key last passed through untouched, so a gesture report right after
+    /// it doesn't act a second time.
+    private var passedAt: [Int32: Date] = [:]
+    /// Gesture reports that came before their media key; each one swallows exactly one key.
+    private var reportedFirst: [Gesture: Date] = [:]
+    /// Test-only gesture map (never saved).
+    var testMap: [Gesture: MacAction]?
     /// Marks key events this app posts, so the tap lets them through. Random per launch, so
     /// other processes can't predict it.
     nonisolated fileprivate static let syntheticMark = Int64.random(in: 1...Int64.max)
@@ -178,7 +217,10 @@ final class GestureController: ObservableObject {
         }
     }
 
-    func action(for g: Gesture) -> MacAction { map[g] ?? .keepDefault }
+    func action(for g: Gesture) -> MacAction {
+        if let testMap { return testMap[g] ?? .keepDefault }
+        return map[g] ?? .keepDefault
+    }
 
     func set(_ action: MacAction, for g: Gesture) {
         map[g] = action
@@ -197,11 +239,16 @@ final class GestureController: ObservableObject {
     }
 
     private var needsTap: Bool {
-        Gesture.allCases.contains { $0.mediaKey != nil && action(for: $0) != .keepDefault }
+        Gesture.allCases.contains { $0.mediaKey != nil }
     }
 
     func start() {
         headphones?.onEvent = { [weak self] key in self?.handleEvent(key) }
+        StopPhraseListener.shared.log = { [weak self] in self?.log($0) }
+        // The tap runs only while the control link is live, so media keys never wait on the app
+        // when it can't match them to a gesture anyway.
+        readyWatch = headphones?.$isReady.removeDuplicates().dropFirst()
+            .sink { [weak self] _ in DispatchQueue.main.async { self?.refresh() } }
         refresh()
         if needsAccess, !accessibilityGranted {
             let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
@@ -212,7 +259,8 @@ final class GestureController: ObservableObject {
 
     func refresh() {
         accessibilityGranted = AXIsProcessTrusted()
-        if needsTap, accessibilityGranted { installTap() } else { removeTap() }
+        let linkUp = headphones?.isReady == true || includeKeyboard
+        if needsTap || observeKeys, accessibilityGranted, linkUp { installTap() } else { removeTap() }
         if needsAccess, !accessibilityGranted, permissionTimer == nil {
             // Pick the permission up as soon as the user grants it in System Settings.
             permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] t in
@@ -235,18 +283,74 @@ final class GestureController: ObservableObject {
 
     // MARK: Headphone events
 
-    private func handleEvent(_ key: String) {
+    /// The playback command the headphones just sent over Bluetooth themselves (opPlay, opPause,
+    /// opNext, opPrev). It comes about 0.1-0.3 s before the gesture report.
+    private var sentOp: (key: String, at: Date)?
+    private static let sentOps: Set<String> = ["opPlay", "opPause", "opNext", "opPrev"]
+
+    func handleEvent(_ key: String) {
+        if Self.sentOps.contains(key) { sentOp = (key, Date()); return }
         guard let g = Gesture.allCases.first(where: { $0.eventKey == key }) else { return }
         // One action per gesture: ignore a repeat of the same event within 0.3 s.
         if let t = recent[g], Date().timeIntervalSince(t) < 0.3 { return }
         recent[g] = Date()
-        let a = action(for: g)
+        let chosen = action(for: g)
+        let a = chosen == .keepDefault ? (g.ownedDefault ?? .keepDefault) : chosen
+        // At most 5 non-media actions (shortcuts, apps, Option taps) in any 5 seconds, whatever the
+        // headphones send. Playback and volume stay unlimited so fast skipping always works.
+        if !a.isMedia {
+            actionTimes = actionTimes.filter { Date().timeIntervalSince($0) < 5 }
+            guard actionTimes.count < 5 else { log("Gesture ignored: too many in 5 s"); return }
+            actionTimes.append(Date())
+        }
         lastEvent = "\(g.isLeft ? L("Left") : L("Right")): \(g.title) → \(a == .keepDefault ? g.builtIn : a.title)"
         log("Gesture \(g.rawValue) → \(a.rawValue)")
-        if let mk = g.mediaKey, let pending = pendingKeys.removeValue(forKey: mk) {
-            pending.cancel() // the swallowed media key was this gesture, not the keyboard
+        if chosen == .keepDefault, let mk = g.mediaKey {
+            // Default playback: act now, unless the headphones' own key just did it.
+            if let t = passedAt.removeValue(forKey: mk), Date().timeIntervalSince(t) < 0.6 {
+                log("Media key \(MediaKey.name(mk)) from the headphones already did it")
+                return
+            }
+            reportedFirst[g] = Date()
+            if !followHeadphones(a) { perform(a, for: g) }
+            return
         }
-        if a != .keepDefault { perform(a, for: g) }
+        if let mk = g.mediaKey {
+            if let pending = pendingKeys.removeValue(forKey: mk) {
+                pending.cancel() // the swallowed media key was this gesture, not the keyboard
+                if let t = pendingSince.removeValue(forKey: mk) {
+                    log("Media key \(MediaKey.name(mk)) matched gesture after \(Int(Date().timeIntervalSince(t) * 1000)) ms")
+                }
+            } else {
+                reportedFirst[g] = Date() // its media key is still on the way
+            }
+        }
+        if a != .keepDefault, !followHeadphones(a) { perform(a, for: g) }
+    }
+
+    /// When the headphones already sent their own playback command, never toggle on top of it
+    /// (that flips play/pause straight back). Play/pause follows their direction with an explicit
+    /// play or pause, which is harmless if the player already got theirs; a skip they already sent
+    /// isn't repeated. Returns true when that settled the action.
+    private func followHeadphones(_ a: MacAction) -> Bool {
+        guard let op = sentOp, Date().timeIntervalSince(op.at) < 1.0 else { return false }
+        sentOp = nil
+        switch (a, op.key) {
+        case (.playPause, "opPlay"), (.playPause, "opPause"):
+            let c: MediaRemote.Command = op.key == "opPlay" ? .play : .pause
+            let ok = MediaRemote.send(c)
+            log("Headphones sent \(op.key); sent \(c == .play ? "play" : "pause")\(ok ? "" : " (no player answered)")")
+            return true
+        case (.next, "opNext"), (.previous, "opPrev"):
+            log("Headphones sent \(op.key) themselves; not repeating it")
+            return true
+        case (.previousSong, "opPrev"):
+            log("Headphones sent opPrev; one more previous to reach the previous song")
+            Self.play(.previous, else: MediaKey.previous)
+            return true
+        default:
+            return false
+        }
     }
 
     // MARK: Media-key tap
@@ -287,25 +391,49 @@ final class GestureController: ObservableObject {
     /// held back: if the headphones report the gesture (just before or within 0.7 s), the key is
     /// dropped and the gesture's action runs instead; otherwise it came from the keyboard and is
     /// passed on unchanged.
-    fileprivate func handleMediaKey(_ key: Int32, down: Bool) -> Bool {
+    func handleMediaKey(_ key: Int32, down: Bool, source: Int64 = 0) -> Bool {
         guard let g = Gesture.allCases.first(where: { $0.mediaKey == key }) else { return false }
+        if down { log("Media key \(MediaKey.name(key)) arrived (source \(source))") }
         let a = action(for: g)
-        guard a != .keepDefault, headphones?.isPresent == true || includeKeyboard else { return false }
+        if a == .keepDefault {
+            guard down else { return false }
+            if let t = reportedFirst.removeValue(forKey: g), Date().timeIntervalSince(t) < 1.0 {
+                log("Media key \(MediaKey.name(key)) dropped: gesture already handled")
+                return true
+            }
+            passedAt[key] = Date() // keyboard (or the headphones' own key): pass it on at once
+            return false
+        }
+        // Only hold keys back while the control link is live: without it no gesture report can
+        // come, and holding would just delay (or lose) the key.
+        guard headphones?.isReady == true || includeKeyboard else {
+            if down { log("Media key \(MediaKey.name(key)) passed on: headphone controls not connected") }
+            return false
+        }
         guard down else { return true } // the matching key-up; re-posts send their own
         if includeKeyboard {
             if recent[g].map({ Date().timeIntervalSince($0) < 1.5 }) != true { perform(a, for: g) }
             return true
         }
-        if let t = recent[g], Date().timeIntervalSince(t) < 1.5 { return true }
+        if let t = reportedFirst.removeValue(forKey: g), Date().timeIntervalSince(t) < 1.5 {
+            log("Media key \(MediaKey.name(key)) dropped: gesture already handled")
+            return true
+        }
         let work = DispatchWorkItem { [weak self] in
             self?.pendingKeys[key] = nil
+            self?.pendingSince[key] = nil
+            self?.log("Media key \(MediaKey.name(key)) passed on: no gesture reported (keyboard)")
             Self.postKey(key) // nothing from the headphones: it was the keyboard
         }
         pendingKeys[key]?.cancel()
         pendingKeys[key] = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7, execute: work)
+        pendingSince[key] = Date()
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.holdWindow, execute: work)
         return true
     }
+
+    /// Installs the media-key tap regardless of the saved map (for `--mediatest`).
+    func installTapForTest() -> Bool { installTap(); return tapActive }
 
     // MARK: Shortcut and app choice
 
@@ -376,15 +504,16 @@ final class GestureController: ObservableObject {
     func perform(_ a: MacAction, for g: Gesture? = nil) {
         switch a {
         case .keepDefault, .nothing: break
-        case .playPause: Self.postKey(MediaKey.play)
-        case .pause:
-            if !MediaRemote.send(.pause) { Self.postKey(MediaKey.play) }
-        case .next: Self.postKey(MediaKey.next)
-        case .previous: Self.postKey(MediaKey.previous)
+        // Playback goes straight to the Now Playing app (no media key, so macOS shows no popup);
+        // the media key is only the fallback if that isn't available.
+        case .playPause: Self.play(.toggle, else: MediaKey.play)
+        case .pause: Self.play(.pause, else: MediaKey.play)
+        case .next: Self.play(.next, else: MediaKey.next)
+        case .previous: Self.play(.previous, else: MediaKey.previous)
         case .previousSong:
             // Most players restart the song on the first "previous"; the second one goes back.
-            Self.postKey(MediaKey.previous)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { Self.postKey(MediaKey.previous) }
+            Self.play(.previous, else: MediaKey.previous)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { Self.play(.previous, else: MediaKey.previous) }
         case .volumeUp: Self.postKey(MediaKey.soundUp)
         case .volumeDown: Self.postKey(MediaKey.soundDown)
         case .mute: Self.postKey(MediaKey.mute)
@@ -393,7 +522,15 @@ final class GestureController: ObservableObject {
         case .ambient: headphones?.setMode(.ambient)
         case .speakToChat:
             if let hp = headphones, let on = hp.speakToChat { hp.setSpeakToChat(!on) }
-        case .doubleTapOption: Self.doubleTapOption()
+        case .doubleTapOption:
+            let listener = StopPhraseListener.shared
+            if listener.isListening {
+                listener.stop() // the button finishes dictation itself
+                Self.doubleTapOption()
+            } else {
+                Self.doubleTapOption()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { listener.start() } // after Dictator has the mic
+            }
         case .shortcut:
             if let g, let s = shortcuts[g] { Self.press(s) } else { log("No shortcut recorded") }
         case .openApp:
@@ -428,6 +565,10 @@ final class GestureController: ObservableObject {
         }
     }
 
+    static func play(_ c: MediaRemote.Command, else key: Int32) {
+        if !MediaRemote.send(c) { postKey(key) }
+    }
+
     /// Posts a media key press, so browsers (YouTube) and music apps get it via Now Playing.
     static func postKey(_ key: Int32) {
         for down in [true, false] {
@@ -458,13 +599,14 @@ private func mediaKeyCallback(proxy: CGEventTapProxy, type: CGEventType, event: 
     }
     let key = Int32((ns.data1 & 0xFFFF_0000) >> 16)
     let state = (ns.data1 & 0xFF00) >> 8
-    let swallow = MainActor.assumeIsolated { controller.handleMediaKey(key, down: state == 0xA) }
+    let source = event.getIntegerValueField(.eventSourceUnixProcessID)
+    let swallow = MainActor.assumeIsolated { controller.handleMediaKey(key, down: state == 0xA, source: source) }
     return swallow ? nil : Unmanaged.passUnretained(event)
 }
 
 /// MediaRemote (private framework) for a real "pause" that doesn't toggle.
 enum MediaRemote {
-    enum Command: Int32 { case play = 0, pause = 1 }
+    enum Command: Int32 { case play = 0, pause = 1, toggle = 2, next = 4, previous = 5 }
 
     private typealias SendFn = @convention(c) (Int32, CFDictionary?) -> Bool
     private static let send: SendFn? = {

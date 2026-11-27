@@ -29,6 +29,8 @@
 	<string>26.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>While you dictate with the headphones, SonyMenu listens on the Mac's microphone for "stop dictation" so it can finish for you. Nothing is recorded.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>SonyMenu talks to your Sony headphones to show their battery and change noise cancelling and other settings.</string>
 </dict>

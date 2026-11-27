@@ -21,7 +21,7 @@
 **Окно «Настройки»**
 - *Основные*: модель, прошивка, качество Bluetooth-соединения, мультипоинт, автовыключение, пауза при снятии, голосовые подсказки, выключение наушников.
 - *Звук*: эквалайзер (пресеты и 5 полос + Clear Bass), DSEE Extreme, Speak-to-Chat с чувствительностью и временем.
-- *Управление*: сенсорная панель, что переключает левая кнопка NC/AMB, касание с удержанием и **переназначение жестов**: любой жест на наушниках может запускать действие на Mac — предыдущая песня, диктовка (двойной ⌥), сочетание клавиш, открыть приложение и т.д.
+- *Управление*: сенсорная панель, что переключает левая кнопка NC/AMB, касание с удержанием и **переназначение жестов**: любой жест на наушниках может запускать действие на Mac — предыдущая песня, диктовка (двойной ⌥; фраза «stop dictation» завершает её), сочетание клавиш, открыть приложение и т.д.
 
 Каждая настройка появляется, только если наушники сообщают, что поддерживают её. Интерфейс на русском или английском — по языку системы.
 
@@ -36,7 +36,7 @@
 
 Нужна **macOS 26 или новее**, Apple Silicon или Intel. Проверено на WH-1000XM5; XM6 должна работать (тот же протокол), XM4 и старше не поддерживаются.
 
-Сборка из исходников: `./build.sh --install` (нужны инструменты разработчика, `xcode-select --install`). Журнал: `~/Library/Logs/SonyMenu.log` — приложите его к [issue](../../issues), если что-то не работает.
+Сборка из исходников: `./build.sh --install` (нужны инструменты разработчика, `xcode-select --install`). Один раз запустите `./make-signing-cert.sh` — тогда новые сборки сохраняют разрешения macOS. Журнал: `~/Library/Logs/SonyMenu.log` — приложите его к [issue](../../issues), если что-то не работает.
 
 Спасибо [@VohidovTohirjon](https://github.com/VohidovTohirjon) за настройки Sony, окно настроек и жесты.
 
@@ -81,11 +81,13 @@ The WH-1000XM5 reports every touch by name over its control channel (time-series
 | Left: NC/AMB press | `keyCustomBtn` | switch NC / Ambient | added on top |
 | Left: NC/AMB hold 2 s | `keyCustomBtnHold` | nothing | free |
 
-"Replaced" gestures reach the Mac as media keys; SonyMenu holds those keys back and runs your action instead. Keyboard media keys still work as usual unless you choose otherwise. The rest happen inside the headphones (or as Bluetooth volume), so your action runs as well. A short two-finger tap isn't a gesture on the XM5.
+For "replaced" gestures SonyMenu runs the action itself, sending it straight to whatever is playing (no media-key popup). When the headphones also send their own play/pause or skip, SonyMenu follows it instead of doing it twice. Keyboard media keys still work as usual unless you choose otherwise. The rest happen inside the headphones (or as Bluetooth volume), so your action runs as well. A short two-finger tap isn't a gesture on the XM5.
 
 Actions: Play/Pause, Pause, Next, Previous, Previous song (skip back instead of restarting), Mac volume up/down/mute, cycle NC/Ambient/Off, Noise cancelling, Ambient, toggle Speak-to-Chat, **double-tap Option** (starts and stops dictation apps like Dictator), **press a keyboard shortcut** (recorded once), **open an app**, or do nothing.
 
-Replacing media-key gestures and pressing keys needs **Accessibility** access (System Settings → Privacy & Security). Because the app is ad-hoc signed, each new build needs the permission again: run `tccutil reset Accessibility local.sonymenu`, open SonyMenu, and allow it.
+After a gesture starts Dictator, saying **"stop dictation"** finishes it and removes the phrase from the text. SonyMenu listens on the Mac's built-in mic (never the headphones' mic, so the sound stays in high quality), only during that dictation, with Apple's on-device recognition.
+
+Replacing media-key gestures and pressing keys needs **Accessibility** access (System Settings → Privacy & Security). Run `./make-signing-cert.sh` once before building: it makes a private local signing certificate, so every rebuild keeps the permission. Without it the app is ad-hoc signed and each build needs it again (`tccutil reset Accessibility local.sonymenu`, then allow).
 
 ### Compatibility
 
@@ -116,6 +118,8 @@ The app logs to `~/Library/Logs/SonyMenu.log`. These modes must run from the bun
 ```bash
 open ~/Applications/SonyMenu.app --args --dump       # raw replies to every read request
 open ~/Applications/SonyMenu.app --args --selftest   # change each setting, read it back, restore it
+open ~/Applications/SonyMenu.app --args --mediatest  # play/pause and skips end to end (needs Accessibility)
+open ~/Applications/SonyMenu.app --args --listentest # "stop dictation" recognition on spoken test audio
 ```
 
 Quit the menu bar app first: only one program can hold the headphones' control channel.
@@ -128,7 +132,8 @@ Sony headphones take commands over Bluetooth RFCOMM (the "MDR" protocol used by 
 - `Headphones.swift`: Bluetooth link, state, settings.
 - `Panel.swift`, `SettingsView.swift`: the UI.
 - `Gestures.swift`: media-key tap and gesture actions.
-- `SelfTest.swift`: the `--selftest` mode.
+- `StopPhrase.swift`: "stop dictation" listener.
+- `SelfTest.swift`, `MediaTest.swift`: the test modes.
 
 ### Disclaimer
 

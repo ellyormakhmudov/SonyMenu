@@ -24,10 +24,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let gap: CGFloat = 6
     private let radius: CGFloat = 20
 
+    func applicationWillTerminate(_ notification: Notification) { hp.stop() }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? Data().write(to: logURL)
         hp.log = { [logURL] line in
-            let stamp = ISO8601DateFormatter().string(from: Date())
+            let fmt = ISO8601DateFormatter()
+            fmt.formatOptions.insert(.withFractionalSeconds)
+            let stamp = fmt.string(from: Date())
             guard let data = "\(stamp) \(line)\n".data(using: .utf8),
                   let h = try? FileHandle(forWritingTo: logURL) else { return }
             h.seekToEndOfFile(); h.write(data); try? h.close()

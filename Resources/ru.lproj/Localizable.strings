@@ -179,3 +179,9 @@
 "Double-tap Option ⌥ (Dictator, dictation)" = "Двойной Option ⌥ (Dictator, диктовка)";
 "Press a keyboard shortcut…" = "Нажать сочетание клавиш…";
 "Open an app…" = "Открыть приложение…";
+
+/* Added with the playback and dictation fixes */
+"Default: %@ on this Mac. Your choice replaces it." = "По умолчанию: %@ на этом Mac. Ваш выбор заменяет это.";
+"Say “stop dictation” to finish dictating" = "Скажите «stop dictation», чтобы закончить диктовку";
+"After a headphone gesture starts Dictator, saying it pastes your words without the phrase. Listens on the Mac's own mic, on this Mac only." = "Когда жест наушников запускает Dictator, эта фраза завершает диктовку и убирает её из текста. Слушает встроенный микрофон Mac, только на этом Mac.";
+"The headphones refused this change (firmware %@). Turn it on once in Sony's Sound Connect app on your phone; it stays on, and this switch then shows it." = "Наушники отклонили это изменение (прошивка %@). Включите его один раз в приложении Sony Sound Connect на телефоне — оно сохранится, и переключатель это покажет.";
