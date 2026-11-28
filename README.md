@@ -20,6 +20,7 @@
 
 **Окно «Настройки»**
 - *Основные*: модель, прошивка, качество Bluetooth-соединения, мультипоинт, автовыключение, пауза при снятии, голосовые подсказки, выключение наушников.
+- **Микрофон Mac при подключении** (включено по умолчанию): macOS при подключении берёт микрофон наушников, и звук становится глухим моно. SonyMenu возвращает микрофон MacBook, и музыка остаётся в стерео. Программы, которые сами выберут микрофон наушников (звонки), по-прежнему его получат.
 - *Звук*: эквалайзер (пресеты и 5 полос + Clear Bass), DSEE Extreme, Speak-to-Chat с чувствительностью и временем.
 - *Управление*: сенсорная панель, что переключает левая кнопка NC/AMB, касание с удержанием и **переназначение жестов**: любой жест на наушниках может запускать действие на Mac — предыдущая песня, диктовка (двойной ⌥), сочетание клавиш, открыть приложение и т.д.
 
@@ -60,6 +61,7 @@ A macOS menu bar app for Sony WH-1000XM5 headphones: battery, noise cancelling, 
 
 **Settings window** (Settings… in the panel)
 - *General*: model, firmware, codec; Bluetooth connection quality (sound vs. stable connection); multipoint; automatic power off; pause when taken off; voice guidance; turn the headphones off.
+- **Keep the Mac's microphone on connect** (on by default): macOS makes the headphone mic the default input when they connect, which drops the sound to the mono call profile. SonyMenu switches the input back to the built-in mic so music stays stereo; apps that pick the headphone mic themselves (calls) still get it.
 - *Sound*: ambient level and voice focus; equalizer presets, plus a custom 5-band EQ with Clear Bass; DSEE Extreme; Speak-to-Chat with sensitivity and timeout.
 - *Controls*: right touch panel on/off; what the left NC/AMB button cycles through; touch and hold → voice assistant or nothing; **gesture remapping** (below).
 

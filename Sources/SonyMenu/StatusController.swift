@@ -64,6 +64,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         gestures.log = { [weak self] in self?.hp.log($0) }
         gestures.start()
 
+        MicGuard.shared.log = { [weak self] in self?.hp.log($0) }
+        MicGuard.shared.start()
+
         hp.start()
 
         // `--settings`: open the Settings window right away (used for screenshots).

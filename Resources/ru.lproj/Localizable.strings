@@ -179,3 +179,5 @@
 "Double-tap Option ⌥ (Dictator, dictation)" = "Двойной Option ⌥ (Dictator, диктовка)";
 "Press a keyboard shortcut…" = "Нажать сочетание клавиш…";
 "Open an app…" = "Открыть приложение…";
+"Keep the Mac's microphone when the headphones connect" = "Оставлять микрофон Mac при подключении наушников";
+"macOS switches to the headphone mic on connect, which makes the sound mono. Apps that choose the headphone mic still get it." = "macOS при подключении берёт микрофон наушников, и звук становится моно. Программы, которые сами выберут микрофон наушников, по-прежнему его получат.";

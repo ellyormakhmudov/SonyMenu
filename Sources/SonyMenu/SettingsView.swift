@@ -62,6 +62,7 @@ private struct GeneralTab: View {
     @EnvironmentObject private var hp: Headphones
     @ObservedObject private var loginItem = LoginItem.shared
     @ObservedObject private var prefs = PanelPrefs.shared
+    @ObservedObject private var micGuard = MicGuard.shared
     @StateObject private var ui = SettingsUI()
 
     var body: some View {
@@ -82,6 +83,10 @@ private struct GeneralTab: View {
                 Toggle(isOn: $prefs.showPlayback) {
                     Text("Show playback controls in the menu bar panel")
                     Text("Previous / Play-Pause / Next and headphone volume.")
+                }
+                Toggle(isOn: $micGuard.enabled) {
+                    Text("Keep the Mac's microphone when the headphones connect")
+                    Text("macOS switches to the headphone mic on connect, which makes the sound mono. Apps that choose the headphone mic still get it.")
                 }
             }
 
